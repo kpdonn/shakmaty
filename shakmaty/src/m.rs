@@ -240,15 +240,10 @@ impl Display for Move {
 /// moves.retain(|m| m.role() == Role::Pawn);
 /// assert_eq!(moves.len(), 16);
 /// ```
-pub type MoveList = ArrayVec<
-    Move,
-    {
-        cfg_select! {
-            feature = "variant" => 270 + 6 * 6 * 5,
-            _ => 270, // kBQQQQQQ/BR5Q/Q6Q/Q6Q/Q6Q/Q6Q/Q6Q/KQQQQQQQ w - -
-        }
-    },
->;
+#[cfg(feature = "variant")]
+pub type MoveList = ArrayVec<Move, { 270 + 6 * 6 * 5 }>;
+#[cfg(not(feature = "variant"))]
+pub type MoveList = ArrayVec<Move, 270>; // kBQQQQQQ/BR5Q/Q6Q/Q6Q/Q6Q/Q6Q/Q6Q/KQQQQQQQ w - -
 
 #[cfg(test)]
 mod tests {

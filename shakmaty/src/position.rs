@@ -523,6 +523,15 @@ pub trait Position {
     /// Generates all legal moves.
     fn legal_moves(&self) -> MoveList;
 
+    /// Generates pseudo-legal moves matching python-chess semantics: all
+    /// rule-following moves for the side to move, including ones that leave
+    /// the side's own king in check. Castling moves are only emitted if fully
+    /// legal. Default impl just returns `legal_moves`; variants that want true
+    /// pseudo-legal generation should override.
+    fn pseudo_legal_moves(&self) -> MoveList {
+        self.legal_moves()
+    }
+
     /// Generates a subset of legal moves: All piece moves and drops of type
     /// `role` to the square `to`, excluding castling moves.
     fn san_candidates(&self, role: Role, to: Square) -> MoveList {
@@ -1161,6 +1170,42 @@ impl Position for Chess {
         if blockers.any() || has_ep {
             moves.retain(|m| is_safe(self, king, *m, blockers));
         }
+
+        moves
+    }
+
+    /// Pseudo-legal moves matching python-chess semantics: every rule-following
+    /// move for the side to move, including ones that leave or put the side's
+    /// own king in check (pinned-piece moves, non-evasions when in check, king
+    /// moves into attacked squares). Castling moves are only emitted if fully
+    /// legal (path clear, king not currently/intermediate/finally attacked).
+    /// En passant is included unconditionally with no king-pin filter.
+    fn pseudo_legal_moves(&self) -> MoveList {
+        let mut moves = MoveList::new();
+
+        let king = self
+            .board()
+            .king_of(self.turn())
+            .expect("king in standard chess");
+        let target = !self.us();
+
+        gen_non_king(self, target, &mut moves);
+        gen_king(self, king, target, &mut moves);
+        gen_castling_moves(
+            self,
+            &self.castles,
+            king,
+            CastlingSide::KingSide,
+            &mut moves,
+        );
+        gen_castling_moves(
+            self,
+            &self.castles,
+            king,
+            CastlingSide::QueenSide,
+            &mut moves,
+        );
+        gen_en_passant(self.board(), self.turn(), self.ep_square, &mut moves);
 
         moves
     }
@@ -3432,51 +3477,12 @@ fn validate<P: Position>(pos: &P, ep_square: Option<EnPassant>) -> PositionError
         }
     }
 
-    if let Some(their_king) = pos.board().king_of(!pos.turn())
-        && pos
-            .king_attackers(their_king, pos.turn(), pos.board().occupied())
-            .any()
-    {
-        errors |= PositionErrorKinds::OPPOSITE_CHECK;
-    }
-
-    let checkers = pos.checkers();
-    if let (Some(a), Some(b), Some(our_king)) = (
-        checkers.first(),
-        checkers.last(),
-        pos.board().king_of(pos.turn()),
-    ) {
-        if let Some(ep_square) = ep_square {
-            // The pushed pawn must be the only checker, or it has uncovered
-            // check by a single sliding piece.
-            if a != b
-                || (a != ep_square.pawn_pushed_to()
-                    && pos
-                        .king_attackers(
-                            our_king,
-                            !pos.turn(),
-                            pos.board()
-                                .occupied()
-                                .without(ep_square.pawn_pushed_to())
-                                .with(ep_square.pawn_pushed_from()),
-                        )
-                        .any())
-            {
-                errors |= PositionErrorKinds::IMPOSSIBLE_CHECK;
-            }
-        } else {
-            // There can be at most two checkers, and discovered checkers
-            // cannot be aligned.
-            if a != b && (checkers.count() > 2 || attacks::aligned(a, our_king, b)) {
-                errors |= PositionErrorKinds::IMPOSSIBLE_CHECK;
-            }
-        }
-    }
-
-    // Multiple steppers cannot be checkers.
-    if (checkers & pos.board().steppers()).more_than_one() {
-        errors |= PositionErrorKinds::IMPOSSIBLE_CHECK;
-    }
+    // OPPOSITE_CHECK and IMPOSSIBLE_CHECK validation intentionally omitted.
+    // We construct positions (e.g. via `swap_turn`) where the side-not-to-move
+    // is in check, and where check geometry would be flagged "impossible" by
+    // upstream — both are needed when feeding pseudo-legal moves for both
+    // sides to the model. Keeping these checks would reject those positions.
+    let _ = ep_square;
 
     errors
 }
@@ -3567,6 +3573,20 @@ fn gen_safe_king<P: Position>(pos: &P, king: Square, target: Bitboard, moves: &m
                 promotion: None,
             });
         }
+    });
+}
+
+/// King moves to every reachable target, with no attack-safety filter. Used
+/// for pseudo-legal generation, where moves into attacked squares are kept.
+fn gen_king<P: Position>(pos: &P, king: Square, target: Bitboard, moves: &mut MoveList) {
+    (attacks::king_attacks(king) & target).for_each(|to| {
+        moves.push(Move::Normal {
+            role: Role::King,
+            from: king,
+            capture: pos.board().role_at(to),
+            to,
+            promotion: None,
+        });
     });
 }
 
