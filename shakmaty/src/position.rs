@@ -369,6 +369,18 @@ impl<P> PositionError<P> {
         self.ignore(PositionErrorKinds::IMPOSSIBLE_CHECK)
     }
 
+    /// Get the position despite [`PositionErrorKinds::MISSING_KING`].
+    ///
+    /// The training-data generator needs this: a candidate move may capture the
+    /// enemy king, and the resulting king-less board is a real board it has to
+    /// report targets for (python-chess represents it without complaint).
+    /// [`Position::pseudo_legal_moves()`] and [`Position::checkers()`] handle a
+    /// king-less side to move; most other methods (`legal_moves`,
+    /// `is_checkmate`, `is_stalemate`) still assume a king and will panic.
+    pub fn ignore_missing_king(self) -> Result<P, Self> {
+        self.ignore(PositionErrorKinds::MISSING_KING)
+    }
+
     /// Returns the reasons for this error.
     pub fn kinds(&self) -> PositionErrorKinds {
         self.errors
@@ -1180,31 +1192,38 @@ impl Position for Chess {
     /// moves into attacked squares). Castling moves are only emitted if fully
     /// legal (path clear, king not currently/intermediate/finally attacked).
     /// En passant is included unconditionally with no king-pin filter.
+    ///
+    /// A side to move with NO king on the board is supported and yields exactly
+    /// what python-chess yields there: no king moves and no castling (its
+    /// `generate_castling_moves` bails on an empty king mask, and
+    /// `clean_castling_rights` zeroes a colour's rights when that colour has no
+    /// king on its back rank), every other move normal. Such a position is
+    /// reachable in the training-data generator, where a candidate move may
+    /// capture the enemy king and the resulting board is a real board the
+    /// generator has to report targets for.
     fn pseudo_legal_moves(&self) -> MoveList {
         let mut moves = MoveList::new();
 
-        let king = self
-            .board()
-            .king_of(self.turn())
-            .expect("king in standard chess");
         let target = !self.us();
 
         gen_non_king(self, target, &mut moves);
-        gen_king(self, king, target, &mut moves);
-        gen_castling_moves(
-            self,
-            &self.castles,
-            king,
-            CastlingSide::KingSide,
-            &mut moves,
-        );
-        gen_castling_moves(
-            self,
-            &self.castles,
-            king,
-            CastlingSide::QueenSide,
-            &mut moves,
-        );
+        if let Some(king) = self.board().king_of(self.turn()) {
+            gen_king(self, king, target, &mut moves);
+            gen_castling_moves(
+                self,
+                &self.castles,
+                king,
+                CastlingSide::KingSide,
+                &mut moves,
+            );
+            gen_castling_moves(
+                self,
+                &self.castles,
+                king,
+                CastlingSide::QueenSide,
+                &mut moves,
+            );
+        }
         gen_en_passant(self.board(), self.turn(), self.ep_square, &mut moves);
 
         moves
@@ -3912,6 +3931,39 @@ mod tests {
     fn test_most_known_legals() {
         let pos: Chess = setup_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1");
         assert_eq!(pos.legal_moves().len(), 218);
+    }
+
+    #[test]
+    fn test_pseudo_legal_moves_of_a_king_less_side() {
+        // Fork behaviour: the board left by a king-capture move is real, and the
+        // king-less side generates exactly what python-chess generates for it —
+        // every ordinary move, no king moves, and no castling (the claimed
+        // rights are cleaned away with the king).
+        let pos: Chess = "r3k2r/8/8/8/8/8/8/R6R w KQkq - 0 1"
+            .parse::<Fen>()
+            .expect("valid fen")
+            .into_position::<Chess>(CastlingMode::Standard)
+            .or_else(PositionError::ignore_invalid_castling_rights)
+            .or_else(PositionError::ignore_missing_king)
+            .expect("king-less position");
+        let moves = pos.pseudo_legal_moves();
+        assert!(moves.iter().all(|m| m.role() != Role::King));
+        assert!(moves.iter().all(|m| !matches!(m, Move::Castle { .. })));
+        // Each rook: six squares along the back rank (blocked by the other
+        // rook) and seven up its file (the last one capturing a black rook).
+        assert_eq!(moves.len(), 26);
+        // The side WITH a king is unaffected (the board is still king-less for
+        // white, so passing the turn needs the same recovery).
+        let black = pos
+            .swap_turn()
+            .or_else(PositionError::ignore_missing_king)
+            .expect("turn passed");
+        assert!(
+            black
+                .pseudo_legal_moves()
+                .iter()
+                .any(|m| m.role() == Role::King)
+        );
     }
 
     #[test]
